@@ -54,8 +54,27 @@ func TestUnmatchedReturnACHRecordShape(t *testing.T) {
 	if !strings.HasPrefix(lines[3], "799R01") {
 		t.Fatalf("addenda record = %q, want an R01 Addenda 99", lines[3])
 	}
-	if got := lines[3][6:21]; got != "111926410064431" {
+	if got := lines[3][6:21]; got != "231380100064431" {
 		t.Fatalf("original trace = %q, want unmatched trace", got)
+	}
+}
+
+func TestACHFixturesUseExampleIdentifiers(t *testing.T) {
+	fixtures := iatDebitACH + "\n" + unmatchedReturnACH
+	for _, old := range []string{"MODAK", "LEGEND", "111926413", "691000134"} {
+		if strings.Contains(fixtures, old) {
+			t.Fatalf("fixture still contains old identifier %q", old)
+		}
+	}
+	for _, replacement := range []string{"PARSN", "ACME BANK", "231380104", "121042882"} {
+		if !strings.Contains(fixtures, replacement) {
+			t.Fatalf("fixture does not contain replacement identifier %q", replacement)
+		}
+	}
+	for i, line := range strings.Split(iatDebitACH, "\n") {
+		if len(line) != 94 {
+			t.Fatalf("IAT record %d length = %d, want 94", i+1, len(line))
+		}
 	}
 }
 
