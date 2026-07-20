@@ -52,6 +52,7 @@ If your Twisp deployment requires an authorization header, pass `-authorization 
 The demo includes:
 
 - `autopend-ppd-debit-settle`: endpoint-free auto-pending PPD debit; move the hold from the pending account to the end-user account, then settle it.
+- `autopend-ppd-debit-return`: endpoint-free auto-pending PPD debit; return the held entry, render its RDFI return file, and validate the generated trace range.
 - `autopend-ppd-credit-settle`: endpoint-free auto-pending PPD credit; move the hold to the end-user account, then settle it.
 - `autopend-unmatched-return`: receive a return with no matching originated trace, post it to the exception account, and show `hasExceptions: true`.
 - `ppd-debit-accepted`: PPD debit accepted and settled.
@@ -119,6 +120,10 @@ The setup creates a second, RDFI-only ACH configuration with:
 direction: RDFI
 autoPending: true
 pendingAccountId: "9fd08f4c-c740-4f9b-89fa-9e0536b326e5"
+traceNumberConfiguration: {
+  minTraceNumber: 1000
+  maxTraceNumber: 5000
+}
 ```
 
 It intentionally has no webhook endpoint. For each auto-pended forward entry, the demo:
@@ -130,6 +135,8 @@ It intentionally has no webhook endpoint. For each auto-pended forward entry, th
 5. prints pending, end-user, and exception account balances along the way
 
 The file monitor changes the file from `PENDING` to `COMPLETED` on its next polling cycle after every entry is terminal.
+
+The `autopend-ppd-debit-return` scenario executes `RETURN` instead of moving and settling the entry. It generates and prints the RDFI return file, extracts the seven-digit sequence from the entry trace number, and fails unless it is within the configured `1000-5000` range.
 
 ## Notes
 

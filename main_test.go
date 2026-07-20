@@ -83,12 +83,30 @@ func TestAutoPendingScenarios(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(selected) != 3 {
-		t.Fatalf("auto-pending scenario count = %d, want 3", len(selected))
+	if len(selected) != 4 {
+		t.Fatalf("auto-pending scenario count = %d, want 4", len(selected))
 	}
 	for _, sc := range selected {
 		if !sc.AutoPending {
 			t.Fatalf("scenario %s is not marked auto-pending", sc.ID)
 		}
+	}
+}
+
+func TestValidateGeneratedTrace(t *testing.T) {
+	file := "6" + strings.Repeat(" ", 78) + "111000170001000" + "\n"
+	trace, err := validateGeneratedTrace(file, 1000, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace != "111000170001000" {
+		t.Fatalf("trace = %q, want 111000170001000", trace)
+	}
+}
+
+func TestValidateGeneratedTraceRejectsOutOfRange(t *testing.T) {
+	file := "6" + strings.Repeat(" ", 78) + "111000170005001" + "\n"
+	if _, err := validateGeneratedTrace(file, 1000, 5000); err == nil {
+		t.Fatal("expected out-of-range trace error")
 	}
 }
