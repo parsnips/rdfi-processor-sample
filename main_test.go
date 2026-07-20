@@ -33,3 +33,80 @@ func TestMakeACHFileReplacesIATDDA(t *testing.T) {
 	}
 	t.Fatal("missing IAT entry detail line")
 }
+
+func TestMakeACHFileWithoutDDALeavesReturnFixtureIntact(t *testing.T) {
+	out := makeACHFile(unmatchedReturnACH, "")
+	if out != unmatchedReturnACH+"\n" {
+		t.Fatal("return fixture changed")
+	}
+}
+
+func TestUnmatchedReturnACHRecordShape(t *testing.T) {
+	lines := strings.Split(unmatchedReturnACH, "\n")
+	if len(lines) != 10 {
+		t.Fatalf("record count = %d, want 10", len(lines))
+	}
+	for i, line := range lines {
+		if len(line) != 94 {
+			t.Fatalf("record %d length = %d, want 94", i+1, len(line))
+		}
+	}
+	if !strings.HasPrefix(lines[3], "799R01") {
+		t.Fatalf("addenda record = %q, want an R01 Addenda 99", lines[3])
+	}
+	if got := lines[3][6:21]; got != "231380100064431" {
+		t.Fatalf("original trace = %q, want unmatched trace", got)
+	}
+}
+
+func TestACHFixturesUseExampleIdentifiers(t *testing.T) {
+	fixtures := iatDebitACH + "\n" + unmatchedReturnACH
+	for _, old := range []string{"MODAK", "LEGEND", "111926413", "691000134"} {
+		if strings.Contains(fixtures, old) {
+			t.Fatalf("fixture still contains old identifier %q", old)
+		}
+	}
+	for _, replacement := range []string{"PARSN", "ACME BANK", "231380104", "121042882"} {
+		if !strings.Contains(fixtures, replacement) {
+			t.Fatalf("fixture does not contain replacement identifier %q", replacement)
+		}
+	}
+	for i, line := range strings.Split(iatDebitACH, "\n") {
+		if len(line) != 94 {
+			t.Fatalf("IAT record %d length = %d, want 94", i+1, len(line))
+		}
+	}
+}
+
+func TestAutoPendingScenarios(t *testing.T) {
+	selected, err := selectScenarios(scenarios(), "^autopend-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 4 {
+		t.Fatalf("auto-pending scenario count = %d, want 4", len(selected))
+	}
+	for _, sc := range selected {
+		if !sc.AutoPending {
+			t.Fatalf("scenario %s is not marked auto-pending", sc.ID)
+		}
+	}
+}
+
+func TestValidateGeneratedTrace(t *testing.T) {
+	file := "6" + strings.Repeat(" ", 78) + "111000170001000" + "\n"
+	trace, err := validateGeneratedTrace(file, 1000, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace != "111000170001000" {
+		t.Fatalf("trace = %q, want 111000170001000", trace)
+	}
+}
+
+func TestValidateGeneratedTraceRejectsOutOfRange(t *testing.T) {
+	file := "6" + strings.Repeat(" ", 78) + "111000170005001" + "\n"
+	if _, err := validateGeneratedTrace(file, 1000, 5000); err == nil {
+		t.Fatal("expected out-of-range trace error")
+	}
+}

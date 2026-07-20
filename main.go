@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ const (
 	defaultTwispAccountID = "000000000000"
 
 	endUserAccountID    = "6c6affb0-5cf5-402b-8d84-01bfc1624a2c"
+	pendingAccountID    = "9fd08f4c-c740-4f9b-89fa-9e0536b326e5"
 	settlementAccountID = "0689377a-2683-11f0-9999-069b540ea27b"
 	suspenseAccountID   = "167d713c-2683-11f0-9c43-069b540ea27b"
 	exceptionAccountID  = "5d6743ea-0da2-4698-a66d-80cd1e172a7e"
@@ -34,19 +36,21 @@ const (
 )
 
 type scenario struct {
-	ID             string
-	Name           string
-	Description    string
-	Template       string
-	DDA            string
-	OnCreate       hookResponse
-	OnSettle       hookResponse
-	ExpectedReturn bool
-	ExpectedNOC    bool
-	ManualReturn   bool
-	RetryOnCreate  bool
-	ReturnCode     string
-	ReturnInfo     string
+	ID                string
+	Name              string
+	Description       string
+	Template          string
+	DDA               string
+	OnCreate          hookResponse
+	OnSettle          hookResponse
+	ExpectedReturn    bool
+	ExpectedNOC       bool
+	ManualReturn      bool
+	RetryOnCreate     bool
+	AutoPending       bool
+	ExpectedException bool
+	ReturnCode        string
+	ReturnInfo        string
 }
 
 type hookRequest struct {
@@ -183,13 +187,14 @@ type appConfig struct {
 }
 
 type runner struct {
-	cfg       appConfig
-	client    *gqlClient
-	runID     string
-	endpoint  string
-	configID  string
-	webhooks  *webhookServer
-	scenarios []*scenario
+	cfg                 appConfig
+	client              *gqlClient
+	runID               string
+	endpoint            string
+	configID            string
+	autoPendingConfigID string
+	webhooks            *webhookServer
+	scenarios           []*scenario
 }
 
 func main() {
@@ -233,13 +238,14 @@ func main() {
 	}()
 
 	r := &runner{
-		cfg:       cfg,
-		client:    newGQLClient(cfg),
-		runID:     shortID(),
-		endpoint:  newUUID(),
-		configID:  newUUID(),
-		webhooks:  webhooks,
-		scenarios: selected,
+		cfg:                 cfg,
+		client:              newGQLClient(cfg),
+		runID:               shortID(),
+		endpoint:            newUUID(),
+		configID:            newUUID(),
+		autoPendingConfigID: newUUID(),
+		webhooks:            webhooks,
+		scenarios:           selected,
 	}
 
 	fmt.Printf("RDFI webhook listening on http://%s/rdfi\n", cfg.ListenAddr)
@@ -271,6 +277,9 @@ func (r *runner) setup(ctx context.Context) error {
 	if err := r.createConfiguration(ctx); err != nil {
 		return err
 	}
+	if err := r.createAutoPendingConfiguration(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -282,6 +291,10 @@ func (r *runner) runScenario(ctx context.Context, sc *scenario) error {
 	returnKey := fmt.Sprintf("rdfi-example-%s-%s-return.ach", r.runID, sc.ID)
 	nocKey := fmt.Sprintf("rdfi-example-%s-%s-noc.ach", r.runID, sc.ID)
 	file := makeACHFile(sc.Template, sc.DDA)
+	configID := r.configID
+	if sc.AutoPending {
+		configID = r.autoPendingConfigID
+	}
 
 	upload, err := r.createUpload(ctx, fileKey)
 	if err != nil {
@@ -291,10 +304,13 @@ func (r *runner) runScenario(ctx context.Context, sc *scenario) error {
 		return err
 	}
 
-	if err := r.processFile(ctx, fileKey); err != nil {
+	if err := r.processFile(ctx, configID, fileKey); err != nil {
 		return err
 	}
-	if _, err := r.waitForFile(ctx, fileKey); err != nil {
+	if sc.AutoPending {
+		return r.finishAutoPendingScenario(ctx, sc, configID, fileKey, returnKey)
+	}
+	if _, err := r.waitForFile(ctx, configID, fileKey, "PROCESSED", "COMPLETED"); err != nil {
 		return err
 	}
 
@@ -310,12 +326,12 @@ func (r *runner) runScenario(ctx context.Context, sc *scenario) error {
 	}
 
 	if sc.ExpectedReturn || sc.ManualReturn {
-		if err := r.generateAndRender(ctx, "RDFI_RETURN", returnKey); err != nil {
+		if _, err := r.generateAndRender(ctx, r.configID, "RDFI_RETURN", returnKey); err != nil {
 			return err
 		}
 	}
 	if sc.ExpectedNOC {
-		if err := r.generateAndRender(ctx, "RDFI_NOC", nocKey); err != nil {
+		if _, err := r.generateAndRender(ctx, r.configID, "RDFI_NOC", nocKey); err != nil {
 			return err
 		}
 	}
@@ -325,10 +341,14 @@ func (r *runner) runScenario(ctx context.Context, sc *scenario) error {
 
 func (r *runner) createAccounts(ctx context.Context) error {
 	query := `
-mutation SetupAccounts($endUser: UUID!, $settlement: UUID!, $suspense: UUID!, $exception: UUID!, $fee: UUID!) {
+mutation SetupAccounts($endUser: UUID!, $pending: UUID!, $settlement: UUID!, $suspense: UUID!, $exception: UUID!, $fee: UUID!) {
   endUser: createAccount(input: {
     accountId: $endUser, code: "rdfi-example.end-user", name: "RDFI Example End User",
     config: { idempotent: true }
+  }) { accountId }
+  pending: createAccount(input: {
+    accountId: $pending, code: "rdfi-example.pending", name: "RDFI Example Auto-Pending",
+    config: { enableConcurrentPosting: true, idempotent: true }
   }) { accountId }
   settlement: createAccount(input: {
     accountId: $settlement, code: "rdfi-example.settlement", name: "RDFI Example Settlement",
@@ -350,10 +370,57 @@ mutation SetupAccounts($endUser: UUID!, $settlement: UUID!, $suspense: UUID!, $e
 	var resp map[string]any
 	return r.client.do(ctx, "create accounts", query, map[string]any{
 		"endUser":    endUserAccountID,
+		"pending":    pendingAccountID,
 		"settlement": settlementAccountID,
 		"suspense":   suspenseAccountID,
 		"exception":  exceptionAccountID,
 		"fee":        feeAccountID,
+	}, &resp)
+}
+
+func (r *runner) createAutoPendingConfiguration(ctx context.Context) error {
+	query := `
+mutation CreateAutoPendingConfiguration($configId: UUID!, $settlement: UUID!, $pending: UUID!, $suspense: UUID!, $exception: UUID!) {
+  ach {
+    createConfiguration(input: {
+      configId: $configId
+      direction: RDFI
+      autoPending: true
+      pendingAccountId: $pending
+      traceNumberConfiguration: {
+        minTraceNumber: 1000
+        maxTraceNumber: 5000
+      }
+      settlementAccountId: $settlement
+      exceptionAccountId: $exception
+      suspenseAccountId: $suspense
+      journalId: "00000000-0000-0000-0000-000000000000"
+      odfiHeaderConfiguration: {
+        immediateDestination: "026009593"
+        immediateDestinationName: "ACME BANK"
+        immediateOrigin: "231380104"
+        immediateOriginName: "RDFI EXAMPLE"
+      }
+      timeZone: "America/Los_Angeles"
+    }) {
+      configId
+      direction
+      autoPending
+      pendingAccountId
+      traceNumberConfiguration {
+        minTraceNumber
+        maxTraceNumber
+      }
+    }
+  }
+}`
+	var resp map[string]any
+	return r.client.do(ctx, "create auto-pending configuration", query, map[string]any{
+		"configId":   r.autoPendingConfigID,
+		"settlement": settlementAccountID,
+		"pending":    pendingAccountID,
+		"suspense":   suspenseAccountID,
+		"exception":  exceptionAccountID,
 	}, &resp)
 }
 
@@ -444,7 +511,7 @@ mutation CreateUpload($key: String!) {
 	return &uploadResponse{UploadURL: resp.Files.CreateUpload.UploadURL, Headers: stringMap(resp.Files.CreateUpload.UploadHeaders)}, nil
 }
 
-func (r *runner) processFile(ctx context.Context, key string) error {
+func (r *runner) processFile(ctx context.Context, configID, key string) error {
 	query := `
 mutation ProcessFile($configId: UUID!, $fileKey: String!) {
   ach {
@@ -454,7 +521,7 @@ mutation ProcessFile($configId: UUID!, $fileKey: String!) {
   }
 }`
 	var resp map[string]any
-	if err := r.client.do(ctx, "process file", query, map[string]any{"configId": r.configID, "fileKey": key}, &resp); err != nil {
+	if err := r.client.do(ctx, "process file", query, map[string]any{"configId": configID, "fileKey": key}, &resp); err != nil {
 		return err
 	}
 	fmt.Println("process file response:")
@@ -466,9 +533,10 @@ type fileInfo struct {
 	FileID           string `json:"fileId"`
 	ProcessingStatus string `json:"processingStatus"`
 	ProcessingDetail string `json:"processingDetail"`
+	HasExceptions    bool   `json:"hasExceptions"`
 }
 
-func (r *runner) waitForFile(ctx context.Context, key string) (*fileInfo, error) {
+func (r *runner) waitForFile(ctx context.Context, configID, key string, statuses ...string) (*fileInfo, error) {
 	query := `
 query FileInfo($configId: UUID!, $fileKey: String!) {
   ach {
@@ -476,6 +544,7 @@ query FileInfo($configId: UUID!, $fileKey: String!) {
       fileId
       processingStatus
       processingDetail
+      hasExceptions
     }
   }
 }`
@@ -485,18 +554,21 @@ query FileInfo($configId: UUID!, $fileKey: String!) {
 				File *fileInfo `json:"file"`
 			} `json:"ach"`
 		}
-		if err := r.client.do(ctx, "read file status", query, map[string]any{"configId": r.configID, "fileKey": key}, &resp); err != nil {
+		if err := r.client.do(ctx, "read file status", query, map[string]any{"configId": configID, "fileKey": key}, &resp); err != nil {
 			return nil, err
 		}
 		if resp.Ach.File != nil {
 			switch resp.Ach.File.ProcessingStatus {
-			case "PROCESSED":
-				fmt.Println("file status:")
-				printJSON(resp.Ach.File)
-				return resp.Ach.File, nil
 			case "ERROR", "INVALID", "ABORTED":
 				printJSON(resp.Ach.File)
 				return nil, fmt.Errorf("file status %s: %s", resp.Ach.File.ProcessingStatus, resp.Ach.File.ProcessingDetail)
+			}
+			for _, status := range statuses {
+				if resp.Ach.File.ProcessingStatus == status {
+					fmt.Println("file status:")
+					printJSON(resp.Ach.File)
+					return resp.Ach.File, nil
+				}
 			}
 		}
 		select {
@@ -505,6 +577,227 @@ query FileInfo($configId: UUID!, $fileKey: String!) {
 		case <-time.After(750 * time.Millisecond):
 		}
 	}
+}
+
+type pendedExecution struct {
+	WorkflowID  string         `json:"workflowId"`
+	ExecutionID string         `json:"executionId"`
+	Task        string         `json:"task"`
+	Context     map[string]any `json:"context"`
+}
+
+func (r *runner) finishAutoPendingScenario(ctx context.Context, sc *scenario, configID, fileKey, returnKey string) error {
+	if sc.ExpectedException {
+		info, err := r.waitForFile(ctx, configID, fileKey, "PENDING", "COMPLETED")
+		if err != nil {
+			return err
+		}
+		if !info.HasExceptions {
+			return fmt.Errorf("unmatched return file did not set hasExceptions")
+		}
+		fmt.Printf("unmatched return posted to exception account %s; hasExceptions=true\n", exceptionAccountID)
+		return r.printAutoPendingBalances(ctx, "after unmatched return")
+	}
+
+	if _, err := r.waitForFile(ctx, configID, fileKey, "PENDING"); err != nil {
+		return err
+	}
+	executions, err := r.pendedExecutions(ctx, configID, fileKey)
+	if err != nil {
+		return err
+	}
+	if len(executions) == 0 {
+		return fmt.Errorf("auto-pending file has no PENDING workflow executions")
+	}
+
+	if err := r.printAutoPendingBalances(ctx, "after automatic PENDING posting"); err != nil {
+		return err
+	}
+	for _, execution := range executions {
+		if execution.Task != "PENDING" {
+			return fmt.Errorf("execution %s task = %s, want PENDING", execution.ExecutionID, execution.Task)
+		}
+		accountID := stringField(execution.Context, "accountId")
+		if accountID != pendingAccountID {
+			return fmt.Errorf("execution %s accountId = %s, want pending account %s", execution.ExecutionID, accountID, pendingAccountID)
+		}
+	}
+
+	if sc.ExpectedReturn {
+		for _, execution := range executions {
+			returned, err := r.executeTask(ctx, execution.WorkflowID, execution.ExecutionID, "RETURN", map[string]any{
+				"effective": time.Now().Format("2006-01-02"),
+				"addenda99": map[string]any{
+					"returnCode":         sc.ReturnCode,
+					"addendaInformation": sc.ReturnInfo,
+				},
+			})
+			if err != nil {
+				return err
+			}
+			if returned.Task != "RETURN" {
+				return fmt.Errorf("execution %s task = %s, want RETURN", execution.ExecutionID, returned.Task)
+			}
+		}
+		if err := r.printAutoPendingBalances(ctx, "after RETURN from the pending account"); err != nil {
+			return err
+		}
+		returnFile, err := r.generateAndRender(ctx, configID, "RDFI_RETURN", returnKey)
+		if err != nil {
+			return err
+		}
+		trace, err := validateGeneratedTrace(returnFile, 1000, 5000)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("validated generated return trace %s is within configured range 1000-5000\n", trace)
+		return nil
+	}
+
+	for _, execution := range executions {
+		moved, err := r.executeTask(ctx, execution.WorkflowID, execution.ExecutionID, "PENDING", map[string]any{
+			"accountId": endUserAccountID,
+		})
+		if err != nil {
+			return err
+		}
+		if accountID := stringField(moved.Context, "accountId"); accountID != endUserAccountID {
+			return fmt.Errorf("moved execution %s accountId = %s, want end-user account %s", execution.ExecutionID, accountID, endUserAccountID)
+		}
+	}
+	if err := r.printAutoPendingBalances(ctx, "after moving PENDING entries to the end-user account"); err != nil {
+		return err
+	}
+
+	for _, execution := range executions {
+		settled, err := r.executeTask(ctx, execution.WorkflowID, execution.ExecutionID, "SETTLE", map[string]any{
+			"effective": time.Now().Format("2006-01-02"),
+		})
+		if err != nil {
+			return err
+		}
+		if settled.Task != "SETTLE" {
+			return fmt.Errorf("execution %s task = %s, want SETTLE", execution.ExecutionID, settled.Task)
+		}
+		if accountID := stringField(settled.Context, "accountId"); accountID != endUserAccountID {
+			return fmt.Errorf("settled execution %s accountId = %s, want end-user account %s", execution.ExecutionID, accountID, endUserAccountID)
+		}
+	}
+	if err := r.printAutoPendingBalances(ctx, "after SETTLE into the end-user account"); err != nil {
+		return err
+	}
+	fmt.Println("all auto-pended entries were moved to the end-user account and settled; the file monitor will transition PENDING to COMPLETED on its next poll")
+	return nil
+}
+
+func (r *runner) pendedExecutions(ctx context.Context, configID, fileKey string) ([]pendedExecution, error) {
+	query := `
+query PendedEntries($configId: UUID!, $fileKey: String!) {
+  ach {
+    file(configId: $configId, fileKey: $fileKey) {
+      records(first: 1000) {
+        nodes {
+          recordType
+          execution {
+            workflowId
+            executionId
+            task
+            context
+          }
+        }
+      }
+    }
+  }
+}`
+	var resp struct {
+		Ach struct {
+			File *struct {
+				Records struct {
+					Nodes []struct {
+						RecordType string           `json:"recordType"`
+						Execution  *pendedExecution `json:"execution"`
+					} `json:"nodes"`
+				} `json:"records"`
+			} `json:"file"`
+		} `json:"ach"`
+	}
+	if err := r.client.do(ctx, "discover auto-pended entries", query, map[string]any{
+		"configId": configID,
+		"fileKey":  fileKey,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Ach.File == nil {
+		return nil, fmt.Errorf("file %s not found", fileKey)
+	}
+	var executions []pendedExecution
+	for _, node := range resp.Ach.File.Records.Nodes {
+		if node.Execution != nil {
+			executions = append(executions, *node.Execution)
+		}
+	}
+	return executions, nil
+}
+
+func (r *runner) executeTask(ctx context.Context, workflowID, executionID, task string, params map[string]any) (*pendedExecution, error) {
+	query := `
+mutation ExecuteAutoPendingTask($workflowId: UUID!, $executionId: UUID!, $task: String!, $params: JSON) {
+  workflow {
+    executeTask(input: { workflowId: $workflowId, executionId: $executionId, task: $task, params: $params }) {
+      workflowId
+      executionId
+      task
+      context
+      output { state }
+      error
+    }
+  }
+}`
+	var resp struct {
+		Workflow struct {
+			ExecuteTask pendedExecution `json:"executeTask"`
+		} `json:"workflow"`
+	}
+	if err := r.client.do(ctx, "execute auto-pending "+task, query, map[string]any{
+		"workflowId":  workflowID,
+		"executionId": executionID,
+		"task":        task,
+		"params":      params,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	fmt.Printf("auto-pending %s response:\n", task)
+	printJSON(resp.Workflow.ExecuteTask)
+	return &resp.Workflow.ExecuteTask, nil
+}
+
+func (r *runner) printAutoPendingBalances(ctx context.Context, label string) error {
+	query := `
+query AutoPendingBalances($pending: UUID!, $endUser: UUID!, $exception: UUID!) {
+  pending: balance(accountId: $pending, journalId: "00000000-0000-0000-0000-000000000000", currency: "USD", materialize: true) {
+    settled { drBalance { units currency } crBalance { units currency } }
+    encumbrance { drBalance { units currency } crBalance { units currency } }
+  }
+  endUser: balance(accountId: $endUser, journalId: "00000000-0000-0000-0000-000000000000", currency: "USD", materialize: true) {
+    settled { drBalance { units currency } crBalance { units currency } }
+    encumbrance { drBalance { units currency } crBalance { units currency } }
+  }
+  exception: balance(accountId: $exception, journalId: "00000000-0000-0000-0000-000000000000", currency: "USD", materialize: true) {
+    settled { drBalance { units currency } crBalance { units currency } }
+    encumbrance { drBalance { units currency } crBalance { units currency } }
+  }
+}`
+	var resp map[string]any
+	if err := r.client.do(ctx, "read balances "+label, query, map[string]any{
+		"pending":   pendingAccountID,
+		"endUser":   endUserAccountID,
+		"exception": exceptionAccountID,
+	}, &resp); err != nil {
+		return err
+	}
+	fmt.Printf("balances %s:\n", label)
+	printJSON(resp)
+	return nil
 }
 
 func (r *runner) executeWorkflow(ctx context.Context, req hookRequest, task, returnCode, returnInfo string) error {
@@ -544,7 +837,7 @@ mutation ExecuteWorkflow($executionId: UUID!, $code: String!, $task: String!, $p
 	return nil
 }
 
-func (r *runner) generateAndRender(ctx context.Context, fileType, key string) error {
+func (r *runner) generateAndRender(ctx context.Context, configID, fileType, key string) (string, error) {
 	query := `
 mutation GenerateFile($configId: UUID!, $fileKey: String!, $fileType: AchFileType!) {
   ach {
@@ -563,21 +856,21 @@ mutation GenerateFile($configId: UUID!, $fileKey: String!, $fileType: AchFileTyp
 		} `json:"ach"`
 	}
 	if err := r.client.do(ctx, "generate "+fileType, query, map[string]any{
-		"configId": r.configID,
+		"configId": configID,
 		"fileKey":  key,
 		"fileType": fileType,
 	}, &resp); err != nil {
-		return err
+		return "", err
 	}
 	fmt.Printf("generate %s response:\n", fileType)
 	printJSON(resp.Ach.GenerateFile)
 	if !resp.Ach.GenerateFile.Generated {
-		return nil
+		return "", nil
 	}
 	return r.downloadAndPrint(ctx, key)
 }
 
-func (r *runner) downloadAndPrint(ctx context.Context, key string) error {
+func (r *runner) downloadAndPrint(ctx context.Context, key string) (string, error) {
 	query := `
 mutation CreateDownload($key: String!) {
   files {
@@ -599,32 +892,51 @@ mutation CreateDownload($key: String!) {
 		} `json:"files"`
 	}
 	if err := r.client.do(ctx, "create download", query, map[string]any{"key": key}, &resp); err != nil {
-		return err
+		return "", err
 	}
 	fmt.Println("download response:")
 	printJSON(resp.Files.CreateDownload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resp.Files.CreateDownload.DownloadURL, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	for k, v := range stringMap(resp.Files.CreateDownload.DownloadHeaders) {
 		req.Header.Set(k, v)
 	}
 	httpResp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer httpResp.Body.Close()
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if httpResp.StatusCode >= 300 {
-		return fmt.Errorf("download %s: status %d: %s", key, httpResp.StatusCode, string(body))
+		return "", fmt.Errorf("download %s: status %d: %s", key, httpResp.StatusCode, string(body))
 	}
 	fmt.Printf("rendered %s:\n%s\n", key, string(body))
-	return nil
+	return string(body), nil
+}
+
+func validateGeneratedTrace(file string, minTrace, maxTrace int) (string, error) {
+	for _, line := range strings.Split(strings.TrimSpace(file), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if len(line) < 94 || line[0] != '6' {
+			continue
+		}
+		trace := line[79:94]
+		sequence, err := strconv.Atoi(trace[8:])
+		if err != nil {
+			return "", fmt.Errorf("generated trace %q has invalid sequence: %w", trace, err)
+		}
+		if sequence < minTrace || sequence > maxTrace {
+			return "", fmt.Errorf("generated trace %s sequence %d is outside configured range %d-%d", trace, sequence, minTrace, maxTrace)
+		}
+		return trace, nil
+	}
+	return "", fmt.Errorf("generated return file has no entry detail trace")
 }
 
 type gqlClient struct {
@@ -729,6 +1041,41 @@ func putFile(ctx context.Context, url string, headers map[string]string, body []
 
 func scenarios() []*scenario {
 	return []*scenario{
+		{
+			ID:          "autopend-ppd-debit-settle",
+			Name:        "Auto-pended PPD debit settled to an end user",
+			Description: "An endpoint-free RDFI configuration automatically pends the debit on its pending account. The demo moves that hold to the end-user account with PENDING, then executes SETTLE.",
+			Template:    ppdDebitACH,
+			DDA:         "200000001",
+			AutoPending: true,
+		},
+		{
+			ID:             "autopend-ppd-debit-return",
+			Name:           "Auto-pended PPD debit returned",
+			Description:    "An endpoint-free RDFI configuration automatically pends the debit. The demo executes RETURN, renders the return file, and validates its generated trace is within the configured 1000-5000 range.",
+			Template:       ppdDebitACH,
+			DDA:            "200000003",
+			AutoPending:    true,
+			ExpectedReturn: true,
+			ReturnCode:     "R01",
+			ReturnInfo:     "Auto-pended debit returned by example",
+		},
+		{
+			ID:          "autopend-ppd-credit-settle",
+			Name:        "Auto-pended PPD credit settled to an end user",
+			Description: "An endpoint-free RDFI configuration automatically pends the credit, moves it from the shared pending account to the end-user account, and settles it there.",
+			Template:    ppdCreditACH,
+			DDA:         "200000002",
+			AutoPending: true,
+		},
+		{
+			ID:                "autopend-unmatched-return",
+			Name:              "Auto-pending configuration receives an unmatched return",
+			Description:       "An inbound PPD return references an original trace unknown to this configuration. Twisp posts it to the exception account and marks the file hasExceptions=true.",
+			Template:          unmatchedReturnACH,
+			AutoPending:       true,
+			ExpectedException: true,
+		},
 		{
 			ID:          "ppd-debit-accepted",
 			Name:        "PPD debit accepted",
@@ -882,6 +1229,9 @@ func selectScenarios(all []*scenario, pattern string) ([]*scenario, error) {
 }
 
 func makeACHFile(template, dda string) string {
+	if dda == "" {
+		return strings.TrimRight(template, "\n") + "\n"
+	}
 	lines := strings.Split(strings.TrimRight(template, "\n"), "\n")
 	iat := false
 	for _, line := range lines {
@@ -1000,17 +1350,36 @@ const ppdCreditACH = `101 03130001202313801041908161055A094101Federal Reserve Ba
 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999
 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999`
 
-const iatDebitACH = `101 111926413 6910001342603100000A094101LEGEND BANK, N.A.      ASF APPLICATION SUPERVI        
-5225                FF3               US770510487CIATIAT PAYPALUSDUSD2603060651091000010000001
-6271119264130007             0000002826695954481211                           1091000015675441
-710WEB000000000000002826                      CONSTANCE FELDMAN                        5675441
-711ASTROLINE                          14 PANAGIOTI TSANGAR 1ST FLOOR, OFF              5675441
-712GERMASOGEIA*LEMESOS\               CY*4047\                                         5675441
-713WELLS FARGO BANK                   01091000019                         US           5675441
-714LEGEND BANK, N.A.                  01111926413                         US           5675441
-7151048710156457  12710 SE SHERMAN ST                                                  5675441
-716PORTLAND*OR\                       US*97233\                                        5675441
-82250000080011192641000000002826000000000000770510487C                         091000010000001
-9000001000001000000080011192641000000002826000000000000                                       
-9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999
-9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999`
+var iatDebitACH = strings.Join([]string{
+	"101 231380104 1210428822603100000A094101ACME BANK, N.A.        ASF APPLICATION SUPERVI" + strings.Repeat(" ", 8),
+	"5225                FF3               US770510487CIATIAT PAYPALUSDUSD2603060651231380100000001",
+	"6272313801040007             0000002826695954481211                           1231380105675441",
+	"710WEB000000000000002826                      CONSTANCE FELDMAN                        5675441",
+	"711ASTROLINE                          14 PANAGIOTI TSANGAR 1ST FLOOR, OFF              5675441",
+	"712GERMASOGEIA*LEMESOS\\               CY*4047\\                                         5675441",
+	"713WELLS FARGO BANK                   01091000019                         US           5675441",
+	"714ACME BANK, N.A.                    01231380104                         US           5675441",
+	"7151048710156457  12710 SE SHERMAN ST                                                  5675441",
+	"716PORTLAND*OR\\                       US*97233\\                                        5675441",
+	"82250000080023138010000000002826000000000000770510487C                         231380100000001",
+	"9000001000001000000080023138010000000002826000000000000" + strings.Repeat(" ", 39),
+	"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+	"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+}, "\n")
+
+// unmatchedReturnACH contains a regular PPD return whose Addenda 99 original
+// trace (231380100064431) was never originated by this fresh configuration.
+// The return therefore has no workflow execution to settle and is posted to
+// the configured exception account instead.
+var unmatchedReturnACH = strings.Join([]string{
+	"101 231380104 1210428822605221343D094101ACME BANK, N.A.        ASF APPLICATION SUPERVI" + strings.Repeat(" ", 8),
+	"5200PARSN                               9876543210PPDPAYMENT   SD06202605211421231380100033187",
+	"6262313801044820617395       0000020000               John Huntley            1231380109557577",
+	"799R0123138010006443100000003130001                                            231380109557577",
+	"820000000200231380100000000200000000000000009876543210                         231380100033187",
+	"9000001000001000000020023138010000000020000000000000000" + strings.Repeat(" ", 39),
+	"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+	"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+	"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+	"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+}, "\n")
