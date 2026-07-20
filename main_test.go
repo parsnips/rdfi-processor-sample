@@ -33,3 +33,43 @@ func TestMakeACHFileReplacesIATDDA(t *testing.T) {
 	}
 	t.Fatal("missing IAT entry detail line")
 }
+
+func TestMakeACHFileWithoutDDALeavesReturnFixtureIntact(t *testing.T) {
+	out := makeACHFile(unmatchedReturnACH, "")
+	if out != unmatchedReturnACH+"\n" {
+		t.Fatal("return fixture changed")
+	}
+}
+
+func TestUnmatchedReturnACHRecordShape(t *testing.T) {
+	lines := strings.Split(unmatchedReturnACH, "\n")
+	if len(lines) != 10 {
+		t.Fatalf("record count = %d, want 10", len(lines))
+	}
+	for i, line := range lines {
+		if len(line) != 94 {
+			t.Fatalf("record %d length = %d, want 94", i+1, len(line))
+		}
+	}
+	if !strings.HasPrefix(lines[3], "799R01") {
+		t.Fatalf("addenda record = %q, want an R01 Addenda 99", lines[3])
+	}
+	if got := lines[3][6:21]; got != "111926410064431" {
+		t.Fatalf("original trace = %q, want unmatched trace", got)
+	}
+}
+
+func TestAutoPendingScenarios(t *testing.T) {
+	selected, err := selectScenarios(scenarios(), "^autopend-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("auto-pending scenario count = %d, want 3", len(selected))
+	}
+	for _, sc := range selected {
+		if !sc.AutoPending {
+			t.Fatalf("scenario %s is not marked auto-pending", sc.ID)
+		}
+	}
+}

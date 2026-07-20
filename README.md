@@ -32,6 +32,7 @@ Run one scenario or a pattern-matched subset:
 go run . -scenario ppd-debit-return-create
 go run . -scenario 'iat|noc'
 go run . -scenario pending
+go run . -scenario autopend
 ```
 
 Useful flags:
@@ -50,6 +51,9 @@ If your Twisp deployment requires an authorization header, pass `-authorization 
 
 The demo includes:
 
+- `autopend-ppd-debit-settle`: endpoint-free auto-pending PPD debit; move the hold from the pending account to the end-user account, then settle it.
+- `autopend-ppd-credit-settle`: endpoint-free auto-pending PPD credit; move the hold to the end-user account, then settle it.
+- `autopend-unmatched-return`: receive a return with no matching originated trace, post it to the exception account, and show `hasExceptions: true`.
 - `ppd-debit-accepted`: PPD debit accepted and settled.
 - `ppd-credit-accepted`: PPD credit accepted and settled.
 - `iat-debit-accepted`: IAT debit accepted and settled.
@@ -63,7 +67,9 @@ The demo includes:
 
 ## How Routing Works
 
-Each scenario is selected by the DDA/account number in the ACH entry detail. The program derives input ACH files from Twisp's PPD debit, PPD credit, and IAT debit test fixtures, replacing only the DDA field with a deterministic scenario value.
+Each webhook-driven scenario is selected by the DDA/account number in the ACH entry detail. The program derives input ACH files from Twisp's PPD debit, PPD credit, and IAT debit test fixtures, replacing only the DDA field with a deterministic scenario value.
+
+The auto-pending configuration does not use DDA routing or a webhook. Its forward entries are posted directly to the configured pending account. The unmatched-return fixture is routed by the original trace in its Addenda 99 record; because that trace was never originated by the fresh configuration, it posts to the exception account.
 
 The webhook handler reads `entryDetail.dfiAccountNumber` from the JSON payload and returns the configured action for that DDA:
 
@@ -88,6 +94,8 @@ For each scenario the program prints:
 9. download link response
 10. rendered ACH return/NOC file content
 
+Auto-pending settlement scenarios additionally print account balances at three points: after the automatic pending post, after moving the hold to the end-user account, and after settlement. The unmatched-return scenario prints the file's `hasExceptions` flag and exception-account balance.
+
 Generated file keys are named `rdfi-example-<run-id>-<scenario>...` in Twisp local's file store. They are intentionally flat because Twisp local's file server writes upload keys directly under its local file directory.
 
 ## Manual Pending Touch Point
@@ -103,6 +111,26 @@ For `ppd-debit-pending`, the webhook returns:
 
 The program prints the `workflow.execute` inputs needed to settle or return the pending entry. It then executes the return path automatically so the example can also demonstrate return file generation.
 
+## Auto-Pending Flow
+
+The setup creates a second, RDFI-only ACH configuration with:
+
+```graphql
+direction: RDFI
+autoPending: true
+pendingAccountId: "9fd08f4c-c740-4f9b-89fa-9e0536b326e5"
+```
+
+It intentionally has no webhook endpoint. For each auto-pended forward entry, the demo:
+
+1. waits for the file to reach `PENDING`
+2. discovers the entry's workflow and execution IDs through `ach.file.records.execution`
+3. executes `PENDING` again with the end-user `accountId`, moving the encumbrance from the shared pending account
+4. executes `SETTLE`, which settles on that end-user account
+5. prints pending, end-user, and exception account balances along the way
+
+The file monitor changes the file from `PENDING` to `COMPLETED` on its next polling cycle after every entry is terminal.
+
 ## Notes
 
-The setup step creates idempotent ledger accounts with stable IDs and creates a fresh endpoint/configuration for each run. This makes repeated runs safe without clearing the local Twisp container.
+The setup step creates idempotent ledger accounts with stable IDs and creates fresh standard and auto-pending configurations for each run. This makes repeated runs safe without clearing the local Twisp container. Because the accounts are intentionally reused, the printed balances accumulate across runs; compare the three snapshots within a scenario to see that run's movement.
